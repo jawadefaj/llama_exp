@@ -17,8 +17,15 @@ model = AutoModelForCausalLM.from_pretrained(model_id)
 block = model.model.layers[0]
 print("Model and tokenizer loaded.\n")
 
+
+# read the trash.txt file
+with open("trash.txt", "r") as file:
+    lines = file.readlines()
+    
+
 # Prepare input
-input_ids = tokenizer("Hello", return_tensors="pt").input_ids
+input_ids = tokenizer(lines[0], return_tensors="pt").input_ids
+print(f"Input IDs shape: {input_ids.shape}")
 inputs_embeds = model.model.embed_tokens(input_ids)
 print(f"Input embeddings shape: {inputs_embeds.shape}")
 
@@ -44,11 +51,11 @@ with tg4perfetto.open(json_file_name):
             # Step 1: Embedding
             with track_embed.trace("Embed_Tokens"):
                 x = inputs_embeds
-
+            print(f"Input shape Embed_Tokens: {x.shape}")
             # Step 2: Input LayerNorm
             with track_norm1.trace("Input_LayerNorm"):
                 x = block.input_layernorm(x)
-
+            print(f"Input shape Input_LayerNorm: {x.shape}")
             # Step 3: Q/K/V projections
             with track_qkv.trace("Q_Projection"):
                 q = block.self_attn.q_proj(x)
@@ -56,6 +63,8 @@ with tg4perfetto.open(json_file_name):
                 k = block.self_attn.k_proj(x)
             with track_qkv.trace("V_Projection"):
                 v = block.self_attn.v_proj(x)
+            
+            print(f"Q shape: {q.shape}, K shape: {k.shape}, V shape: {v.shape}")
 
             # Simulate attention steps
             with track_softmax.trace("DotProduct_QK^T"):

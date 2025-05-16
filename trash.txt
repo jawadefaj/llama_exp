@@ -23,6 +23,9 @@ Transformer block: LlamaDecoderLayer(
   (input_layernorm): LlamaRMSNorm((2048,), eps=1e-05)
   (post_attention_layernorm): LlamaRMSNorm((2048,), eps=1e-05)
 )
+
+
+
 LlamaForCausalLM(
   (model): LlamaModel(
     (embed_tokens): Embedding(128256, 2048)
@@ -49,6 +52,10 @@ LlamaForCausalLM(
   )
   (lm_head): Linear(in_features=2048, out_features=128256, bias=False)
 )
+
+
+
+
 LlamaConfig {
   "_attn_implementation_autoset": true,
   "architectures": [
