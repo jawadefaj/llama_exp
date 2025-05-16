@@ -1,0 +1,45 @@
+# Byte-compiled / cache files
+__pycache__/
+*.py[cod]
+*.so
+
+# Jupyter notebook checkpoints
+.ipynb_checkpoints/
+
+# Logs and traces
+log/
+*.trace.json
+*.pt.trace.json
+*.prof
+
+# Model weights and cache
+*.ckpt
+*.safetensors
+*.bin
+*.pth
+
+# Hugging Face and PyTorch cache
+~/.cache/huggingface/
+~/.cache/torch/
+*.tmp
+
+# Environment and dependency files
+.env
+.venv/
+env/
+venv/
+
+# VSCode settings (optional)
+.vscode/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Python tooling
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Project-specific
+setup-checkpoint.sh
+trash-checkpoint.txt
