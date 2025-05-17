@@ -10,7 +10,7 @@ if not torch.cuda.is_available():
     torch.Tensor.cuda = lambda self, *a, **k: self
 
 # ───── 1. paths & small hyper-params ─────
-CKPT_DIR = Path(r"C:\Users\abjaw\OneDrive\Documents\GitHub\llama_exp\Llama-3.2-1B\original")
+CKPT_DIR = Path(r"C:\Users\abjaw\OneDrive\Documents\GitHub\llama_exp\models\Llama-3.2-1B\original")
 TOKENIZER_PATH = CKPT_DIR / "tokenizer.model"
 MAX_SEQ_LEN, MAX_BATCH_SIZE = 128, 4
 DEVICE = torch.device("cpu")

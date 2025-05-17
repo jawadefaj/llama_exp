@@ -43,3 +43,4 @@ pip-delete-this-directory.txt
 # Project-specific
 setup-checkpoint.sh
 trash-checkpoint.txt
+/models
