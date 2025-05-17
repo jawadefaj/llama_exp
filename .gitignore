@@ -44,3 +44,4 @@ pip-delete-this-directory.txt
 setup-checkpoint.sh
 trash-checkpoint.txt
 /models
+*.json
