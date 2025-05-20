@@ -7,7 +7,7 @@
 # ---------------------------------------------------------------------------
 
 from __future__ import annotations
-import math, os, atexit, datetime
+import math, os, atexit, datetime, time       
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Tuple, Generator
@@ -46,11 +46,11 @@ def trace_op(name: str, **meta) -> Generator[None, None, None]:
     trk = _TRACKS[eng]
     cm = trk.trace(name, meta)
     cm.__enter__()
-    start_ns = tg4perfetto.now_ns()
+    start_ns = time.perf_counter_ns()
     try:
         yield
     finally:
-        dur = tg4perfetto.now_ns() - start_ns
+        dur = time.perf_counter_ns() - start_ns
         _ENGINE_FREE_AT[eng] = start_ns + dur
         cm.__exit__(None, None, None)
 
@@ -165,13 +165,13 @@ class Attention(nn.Module):
 
         attn_out = []
         for h in range(self.n_local_heads):
-            qh = q[..., h, :]
-            kh = keys[..., h, :, :]
-            vh = values[..., h, :, :]
+            qh = q[:, :, h, :]
+            kh = keys[:, :, h, :]
+            vh = values[:, :, h, :]
 
-            # Dot-product
+            # Dot-product            
             with trace_op(f"Dot_H{h}", op="MatMul", inputs={"q": qh, "k": kh}):
-                scores = torch.einsum("btd,bSd->bts", qh, kh) / math.sqrt(head_dim)
+                scores = torch.einsum("btd,bsd->bts", qh, kh) / math.sqrt(head_dim)
 
             # 3-pass softmax
             with trace_op(f"Softmax_MaxSub_H{h}", op="MaxSub", inputs={"scores": scores}):
@@ -183,7 +183,7 @@ class Attention(nn.Module):
 
             # Attention-weighted value
             with trace_op(f"AttnV_H{h}", op="MatMul", inputs={"scores": scores, "v": vh}):
-                out_h = torch.einsum("bts,bSd->btd", scores, vh)
+                out_h = torch.einsum("bts,bsd->btd", scores, vh)
             attn_out.append(out_h)
 
         # 4. Concat & output projection

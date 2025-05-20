@@ -45,3 +45,4 @@ setup-checkpoint.sh
 trash-checkpoint.txt
 /models
 *.json
+/nautilus
