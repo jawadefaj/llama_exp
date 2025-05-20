@@ -12,7 +12,7 @@ set -e
 read -p "Enter the URL from email: " PRESIGNED_URL
 echo ""
 read -p "Enter the list of models to download without spaces (8B,8B-instruct,70B,70B-instruct), or press Enter for all: " MODEL_SIZE
-TARGET_FOLDER="/project/llama_exp"            # where all files should end up
+TARGET_FOLDER="/project/llama_exp/model"            # where all files should end up
 mkdir -p ${TARGET_FOLDER}
 
 if [[ $MODEL_SIZE == "" ]]; then
