@@ -3,16 +3,18 @@
 # ---------------------------------------------------------------------------
 # llama/model.py  •  CPU & GPU compatible + always-on Perfetto tracing
 #   • Each slice carries detailed metadata: compute op, input/output shapes,
-#     dtypes, and byte counts.
+#     dtypes, byte counts, and device.
 # ---------------------------------------------------------------------------
 
 from __future__ import annotations
-import math, os, atexit, datetime, time       
+import math, os, atexit, datetime, time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Tuple, Generator
+from typing import Optional, Generator
+
 import torch
 import torch.nn.functional as F
+import torch.distributed as dist
 import fairscale.nn.model_parallel.initialize as fs_init
 from fairscale.nn.model_parallel.layers import (
     ColumnParallelLinear,
@@ -24,24 +26,36 @@ import tg4perfetto
 from contextlib import contextmanager
 
 # --------------------------------------------------------------------------- #
-# 🗂️  GLOBAL PERFETTO TRACKS (one per compute engine)                         #
+# 🗂️  GLOBAL PERFETTO TRACKS (one per compute-engine, per device)             #
 # --------------------------------------------------------------------------- #
 N_ENGINES = 4
-_TRACKS = [tg4perfetto.track(f"Engine-{i}") for i in range(N_ENGINES)]
-_ENGINE_FREE_AT = [0.0] * N_ENGINES  # wall-clock ends of last slice
+_world_size = dist.get_world_size() if dist.is_initialized() else 1
+
+# Build one track per (device_rank, engine_id)
+_TRACKS: list[tg4perfetto.Track] = []
+for dev_rank in range(_world_size):
+    dev_name = f"GPU{dev_rank}" if torch.cuda.is_available() else f"CPU{dev_rank}"
+    for eng in range(N_ENGINES):
+        _TRACKS.append(tg4perfetto.track(f"{dev_name}-Engine-{eng}"))
+
+_ENGINE_FREE_AT = [0.0] * len(_TRACKS)
 
 def _pick_engine() -> int:
-    """Greedy earliest-free scheduler."""
-    return min(range(N_ENGINES), key=_ENGINE_FREE_AT.__getitem__)
+    """Greedy earliest-free scheduler across all tracks."""
+    return min(range(len(_TRACKS)), key=_ENGINE_FREE_AT.__getitem__)
 
 @contextmanager
 def trace_op(name: str, **meta) -> Generator[None, None, None]:
     """
-    Context-manager that drops the slice on whichever engine is free.
-    Usage:
-        with trace_op("Q_proj", op="Linear", inputs=..., output=...):
-            ...
+    Context-manager for a traced slice on whichever engine is free.
+    Adds 'device' metadata to each slice.
     """
+    # annotate which device this is
+    if torch.cuda.is_available():
+        meta["device"] = f"cuda:{torch.cuda.current_device()}"
+    else:
+        meta["device"] = f"cpu:{dist.get_rank() if dist.is_initialized() else 0}"
+
     eng = _pick_engine()
     trk = _TRACKS[eng]
     cm = trk.trace(name, meta)
@@ -89,7 +103,7 @@ class RMSNorm(nn.Module):
 def precompute_freqs_cis(dim: int, end: int, theta: float = 10_000.0):
     freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: dim // 2].float() / dim))
     t = torch.arange(end, dtype=torch.float32, device=freqs.device)
-    return torch.polar(torch.ones_like(freqs), torch.outer(t, freqs))  # complex64
+    return torch.polar(torch.ones_like(freqs), torch.outer(t, freqs))
 
 def reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor):
     return freqs_cis.view(
@@ -128,11 +142,20 @@ class Attention(nn.Module):
         self.n_rep = self.n_local_heads // self.n_local_kv_heads
         self.head_dim = args.dim // args.n_heads
 
-        self.q_proj = ColumnParallelLinear(args.dim, args.n_heads * self.head_dim, bias=False)
-        self.k_proj = ColumnParallelLinear(args.dim, self.n_kv_heads * self.head_dim, bias=False)
-        self.v_proj = ColumnParallelLinear(args.dim, self.n_kv_heads * self.head_dim, bias=False)
+        self.q_proj = ColumnParallelLinear(
+            args.dim, args.n_heads * self.head_dim, bias=False
+        )
+        self.k_proj = ColumnParallelLinear(
+            args.dim, self.n_kv_heads * self.head_dim, bias=False
+        )
+        self.v_proj = ColumnParallelLinear(
+            args.dim, self.n_kv_heads * self.head_dim, bias=False
+        )
         self.o_proj = RowParallelLinear(
-            args.n_heads * self.head_dim, args.dim, bias=False, input_is_parallel=True
+            args.n_heads * self.head_dim,
+            args.dim,
+            bias=False,
+            input_is_parallel=True
         )
 
         shape = (args.max_batch_size, args.max_seq_len, self.n_local_kv_heads, self.head_dim)
@@ -141,21 +164,18 @@ class Attention(nn.Module):
 
     def forward(self, x, start_pos, freqs_cis, mask):
         B, T, _ = x.shape
-        head_dim = self.head_dim
+        hd = self.head_dim
 
-        # 1. Projections
-        with trace_op("Q_proj", op="Linear", inputs={"x": x}, output_shape=(B, T, self.n_local_heads, head_dim)):
-            q = self.q_proj(x).view(B, T, self.n_local_heads, head_dim)
-        with trace_op("K_proj", op="Linear", inputs={"x": x}, output_shape=(B, T, self.n_local_kv_heads, head_dim)):
-            k = self.k_proj(x).view(B, T, self.n_local_kv_heads, head_dim)
-        with trace_op("V_proj", op="Linear", inputs={"x": x}, output_shape=(B, T, self.n_local_kv_heads, head_dim)):
-            v = self.v_proj(x).view(B, T, self.n_local_kv_heads, head_dim)
+        with trace_op("Q_proj", op="Linear", inputs={"x": x}, output_shape=(B, T, self.n_local_heads, hd)):
+            q = self.q_proj(x).view(B, T, self.n_local_heads, hd)
+        with trace_op("K_proj", op="Linear", inputs={"x": x}, output_shape=(B, T, self.n_local_kv_heads, hd)):
+            k = self.k_proj(x).view(B, T, self.n_local_kv_heads, hd)
+        with trace_op("V_proj", op="Linear", inputs={"x": x}, output_shape=(B, T, self.n_local_kv_heads, hd)):
+            v = self.v_proj(x).view(B, T, self.n_local_kv_heads, hd)
 
-        # 2. Rotary positional encoding
         with trace_op("RoPE", op="RoPE", inputs={"q": q, "k": k}, output_shape=q.shape):
             q, k = apply_rotary_emb(q, k, freqs_cis)
 
-        # 3. Write to KV cache
         with trace_op("KV_write", op="MemCopy", inputs={"K": k, "V": v}):
             self.cache_k[:, start_pos:start_pos+T] = k
             self.cache_v[:, start_pos:start_pos+T] = v
@@ -169,11 +189,9 @@ class Attention(nn.Module):
             kh = keys[:, :, h, :]
             vh = values[:, :, h, :]
 
-            # Dot-product            
             with trace_op(f"Dot_H{h}", op="MatMul", inputs={"q": qh, "k": kh}):
-                scores = torch.einsum("btd,bsd->bts", qh, kh) / math.sqrt(head_dim)
+                scores = torch.einsum("btd,bsd->bts", qh, kh) / math.sqrt(hd)
 
-            # 3-pass softmax
             with trace_op(f"Softmax_MaxSub_H{h}", op="MaxSub", inputs={"scores": scores}):
                 scores = scores - scores.amax(-1, keepdim=True)
             with trace_op(f"Softmax_Exp_H{h}", op="Exp", inputs={"scores": scores}):
@@ -181,12 +199,10 @@ class Attention(nn.Module):
             with trace_op(f"Softmax_Norm_H{h}", op="Normalize", inputs={"scores": scores}):
                 scores = scores / scores.sum(-1, keepdim=True)
 
-            # Attention-weighted value
             with trace_op(f"AttnV_H{h}", op="MatMul", inputs={"scores": scores, "v": vh}):
                 out_h = torch.einsum("bts,bsd->btd", scores, vh)
             attn_out.append(out_h)
 
-        # 4. Concat & output projection
         cat = torch.cat(attn_out, dim=-1)
         with trace_op("O_proj", op="Linear", inputs={"cat": cat}, output_shape=cat.shape):
             return self.o_proj(cat)
@@ -264,9 +280,8 @@ class Transformer(nn.Module):
         if seqlen > 1:
             mask = torch.full((seqlen, seqlen), float("-inf"), device=tokens.device)
             mask = torch.triu(mask, diagonal=1)
-            mask = torch.hstack(
-                [torch.zeros((seqlen, start_pos), device=tokens.device), mask]
-            ).type_as(h)
+            prefix = torch.zeros((seqlen, start_pos), device=tokens.device)
+            mask = torch.hstack([prefix, mask]).type_as(h)
 
         for layer in self.layers:
             h = layer(h, start_pos, freqs_cis, mask)
