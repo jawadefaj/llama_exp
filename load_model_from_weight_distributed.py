@@ -1,7 +1,11 @@
-# Updated load_model_from_weight.py
+# load_model_from_weight_distributed.py
 # Adapted for multi-GPU/multi-CPU with Perfetto tracing per rank
+# Includes workaround for libuv error on Windows by disabling USE_LIBUV
 
 import os
+# Disable libuv rendezvous on platforms without libuv support
+os.environ.setdefault('USE_LIBUV', '0')
+
 import logging
 from pathlib import Path
 import time
@@ -15,7 +19,7 @@ import fairscale.nn.model_parallel.initialize as fs_init
 logging.basicConfig(level=logging.DEBUG,
                     format="[%(asctime)s] %(levelname)s:%(name)s: %(message)s")
 logger = logging.getLogger(__name__)
-logger.debug("Starting load_model_from_weight script.")
+logger.debug("Starting load_model_from_weight_distributed script.")
 
 # ───── 0. CUDA patch for CPU-only ─────
 if not torch.cuda.is_available():
@@ -24,7 +28,17 @@ if not torch.cuda.is_available():
 
 # ───── 1. Distributed init & device selection ─────
 backend = "nccl" if torch.cuda.is_available() else "gloo"
-dist.init_process_group(backend=backend, init_method="env://")
+# Use TCP rendezvous on platforms without libuv (e.g. Windows)
+if os.environ.get('USE_LIBUV','0') == '0':
+    # fallback to TCP loopback rendezvous
+    dist.init_process_group(
+        backend=backend,
+        init_method="tcp://127.0.0.1:29500",
+        rank=int(os.environ.get("RANK", "0")),
+        world_size=int(os.environ.get("WORLD_SIZE", "1")),
+    )
+else:
+    dist.init_process_group(backend=backend, init_method="env://")
 local_rank = int(os.environ.get("LOCAL_RANK", "0"))
 world_size = dist.get_world_size()
 global_rank = dist.get_rank()
@@ -41,6 +55,10 @@ logger.debug(f"Initialized process group: rank {global_rank}/{world_size}, using
 fs_init.initialize_model_parallel(world_size)
 logger.debug(f"Model parallel initialized with size={world_size}")
 
+
+
+
+
 # ───── 3. Paths & hyperparameters ─────
 CKPT_DIR = Path(r"C:\Users\abjaw\OneDrive\Documents\GitHub\llama_exp\models\Llama-3.2-1B\original")
 TOKENIZER_PATH = CKPT_DIR / "tokenizer.model"
@@ -49,7 +67,7 @@ logger.debug(f"Checkpoint directory: {CKPT_DIR}")
 logger.debug(f"max_seq_len={MAX_SEQ_LEN}, max_batch_size={MAX_BATCH_SIZE}")
 
 # ───── 4. Late imports ─────
-from llama.model import ModelArgs, Transformer
+from llama._model import ModelArgs, Transformer
 from llama.tokenizer import Tokenizer
 logger.debug("Imported Transformer and Tokenizer modules")
 

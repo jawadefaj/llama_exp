@@ -48,7 +48,7 @@ logger.debug("Model parallel initialized with size=1.")
 
 
 # ───── 3. late imports (after patch & PG init) ─────
-from llama.model import ModelArgs, Transformer
+from llama._model import ModelArgs, Transformer
 from llama.tokenizer import Tokenizer
 logger.debug("Imported Transformer and Tokenizer modules.")
 
