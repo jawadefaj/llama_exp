@@ -217,7 +217,7 @@ class Attention(nn.Module):
 
             # ② 3‑pass soft‑max
             with _dispatch(f"H{h}_SoftmaxP1", op="ReduceMax", in_shape=score_h.shape):
-                max_h = score_h.max(-1, keepdim=True)
+                max_h = score_h.max(-1, keepdim=True).values
             with _dispatch(f"H{h}_SoftmaxP2", op="ElementwiseExp"):
                 score_h = (score_h - max_h).exp()
             with _dispatch(f"H{h}_SoftmaxP3", op="Normalize"):
