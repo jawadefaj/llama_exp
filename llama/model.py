@@ -27,21 +27,15 @@ def tensor_meta(name: str, x: torch.Tensor) -> dict:
     }
 
 # --- Perfetto tracing setup ---
-# single global trace to combine all events into one file
-_trace = tg4perfetto.trace(session_name="llama_trace")
-_CPU_TRACK = _trace.track("CPU")
-_GPU_TRACK = _trace.track("GPU")
+# Use tg4perfetto.open in your entrypoint to start/stop recording:
+#   with tg4perfetto.open("llama.perfetto-trace"):
+#       <run your model forward/training here>
+# Tracks will be saved automatically by tg4perfetto.open
 
-import atexit
+_CPU_TRACK = tg4perfetto.track("CPU")
+_GPU_TRACK = tg4perfetto.track("GPU")
 
-def _write_trace():
-    # write combined trace at exit
-    _trace.save("llama_perfetto_trace.json")
-
-# ensure we flush on program end
-atexit.register(_write_trace)
-
-def trace_op(name: str, **meta):
+def trace_op(name: str, **meta):(name: str, **meta):
     # choose track by device type
     device = meta.get("device")
     track = _GPU_TRACK if device and device.startswith("cuda") else _CPU_TRACK
