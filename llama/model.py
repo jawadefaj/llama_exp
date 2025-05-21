@@ -1,16 +1,19 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
-# Licensed under the Llama 3 Community License Agreement.
+# Licensed under the Llama 3 Community License Agreement.
 # ---------------------------------------------------------------------------
-# llama/model.py  •  CPU & GPU compatible + always-on Perfetto tracing
-#   • Each slice carries detailed metadata: compute op, input/output shapes,
-#     dtypes, byte counts, and device.
+# llama/model.py  •  CPU & GPU compatible + fine‑grained Perfetto tracing
+# ---------------------------------------------------------------------------
+#   ▸ Four compute‑engine tracks per device (GPU0‑Engine‑0 … GPU0‑Engine‑3)
+#   ▸ Chunked Q/K/V projections → 4 slices in parallel
+#   ▸ Per‑head attention:   QK matmul → 3‑pass soft‑max → value matmul
+#   ▸ Each slice carries op‑type + tensor‑shape metadata
 # ---------------------------------------------------------------------------
 
 from __future__ import annotations
-import math, os, atexit, datetime, time
+import math, os, atexit, datetime, time, contextlib
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Generator
+from typing import Optional, List, Generator
 
 import torch
 import torch.nn.functional as F
@@ -23,50 +26,53 @@ from fairscale.nn.model_parallel.layers import (
 )
 from torch import nn
 import tg4perfetto
-from contextlib import contextmanager
 
 # --------------------------------------------------------------------------- #
-# 🗂️  GLOBAL PERFETTO TRACKS (one per compute-engine, per device)             #
+# 🗂️  GLOBAL PERFETTO TRACKS (one per compute engine, per device / rank)      #
 # --------------------------------------------------------------------------- #
-N_ENGINES = 4
+N_ENGINES = 4                                         # configurable ‑‑n_engines flag later
 _world_size = dist.get_world_size() if dist.is_initialized() else 1
 
-# Build one track per (device_rank, engine_id)
-_TRACKS: list[tg4perfetto.Track] = []
-for dev_rank in range(_world_size):
-    dev_name = f"GPU{dev_rank}" if torch.cuda.is_available() else f"CPU{dev_rank}"
+_TRACKS: List[tg4perfetto.Track] = []
+for rank in range(_world_size):
+    dev_name = f"GPU{rank}" if torch.cuda.is_available() else f"CPU{rank}"
     for eng in range(N_ENGINES):
         _TRACKS.append(tg4perfetto.track(f"{dev_name}-Engine-{eng}"))
 
-_ENGINE_FREE_AT = [0.0] * len(_TRACKS)
+_ENGINE_FREE_AT: List[float] = [0.0] * len(_TRACKS)
 
 def _pick_engine() -> int:
-    """Greedy earliest-free scheduler across all tracks."""
+    """Greedy earliest‑free engine across *all* devices/tracks."""
     return min(range(len(_TRACKS)), key=_ENGINE_FREE_AT.__getitem__)
 
-@contextmanager
+@contextlib.contextmanager
 def trace_op(name: str, **meta) -> Generator[None, None, None]:
-    """
-    Context-manager for a traced slice on whichever engine is free.
-    Adds 'device' metadata to each slice.
-    """
-    # annotate which device this is
+    """Emit a Perfetto slice on the earliest‑free compute engine."""
+    meta = dict(meta)  # make a local copy
     if torch.cuda.is_available():
         meta["device"] = f"cuda:{torch.cuda.current_device()}"
     else:
         meta["device"] = f"cpu:{dist.get_rank() if dist.is_initialized() else 0}"
 
     eng = _pick_engine()
-    trk = _TRACKS[eng]
-    cm = trk.trace(name, meta)
+    track = _TRACKS[eng]
+    cm = track.trace(name, meta)
     cm.__enter__()
-    start_ns = time.perf_counter_ns()
+    start = time.perf_counter_ns()
     try:
         yield
     finally:
-        dur = time.perf_counter_ns() - start_ns
-        _ENGINE_FREE_AT[eng] = start_ns + dur
+        dur = time.perf_counter_ns() - start
+        _ENGINE_FREE_AT[eng] = start + dur
         cm.__exit__(None, None, None)
+
+# --------------------------------------------------------------------------- #
+# Convenience: dispatch helper that wraps the engine scheduling + metadata    #
+# --------------------------------------------------------------------------- #
+@contextlib.contextmanager
+def _dispatch(name: str, op: str, **meta):
+    with trace_op(name, op=op, **meta):
+        yield
 
 # --------------------------------------------------------------------------- #
 # MODEL ARGUMENTS                                                             #
@@ -82,6 +88,7 @@ class ModelArgs:
     ffn_dim_multiplier: Optional[float] = None
     norm_eps: float = 1e-5
     rope_theta: float = 500_000
+
     max_batch_size: int = 32
     max_seq_len: int = 2048
 
@@ -100,15 +107,18 @@ class RMSNorm(nn.Module):
     def forward(self, x):
         return self._norm(x.float()).type_as(x) * self.weight
 
+
 def precompute_freqs_cis(dim: int, end: int, theta: float = 10_000.0):
     freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: dim // 2].float() / dim))
     t = torch.arange(end, dtype=torch.float32, device=freqs.device)
     return torch.polar(torch.ones_like(freqs), torch.outer(t, freqs))
 
+
 def reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor):
     return freqs_cis.view(
         *[d if i in (1, x.ndim - 1) else 1 for i, d in enumerate(x.shape)]
     )
+
 
 def apply_rotary_emb(xq, xk, freqs_cis):
     xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
@@ -119,18 +129,28 @@ def apply_rotary_emb(xq, xk, freqs_cis):
         torch.view_as_real(xk_ * freqs_cis).flatten(3).type_as(xk),
     )
 
+
 def repeat_kv(x: torch.Tensor, n_rep: int):
     if n_rep == 1:
         return x
-    bs, slen, n_kv_heads, hd = x.shape
-    return (
-        x[:, :, :, None, :]
-         .expand(bs, slen, n_kv_heads, n_rep, hd)
-         .reshape(bs, slen, n_kv_heads * n_rep, hd)
-    )
+    b, s, n_kv, hd = x.shape
+    return x[:, :, :, None, :].expand(b, s, n_kv, n_rep, hd).reshape(b, s, n_kv * n_rep, hd)
 
 # --------------------------------------------------------------------------- #
-# ATTENTION WITH PER-HEAD SLICES + 3-PASS SOFTMAX                             #
+# INTERNAL helper – chunked linear (no bias) with dispatch per chunk          #
+# --------------------------------------------------------------------------- #
+
+def _chunked_linear(x: torch.Tensor, weight: torch.Tensor, name_prefix: str, n_chunks: int = N_ENGINES):
+    """Split *weight* rows into n_chunks and run F.linear for each, traced."""
+    w_splits = torch.chunk(weight, n_chunks, dim=0)
+    outs = []
+    for idx, w in enumerate(w_splits):
+        with _dispatch(f"{name_prefix}#{idx}", op="Linear", w_shape=w.shape, x_shape=x.shape):
+            outs.append(F.linear(x, w))
+    return torch.cat(outs, dim=-1)
+
+# --------------------------------------------------------------------------- #
+# ATTENTION – per‑head slices + 3‑pass softmax + chunked projections          #
 # --------------------------------------------------------------------------- #
 class Attention(nn.Module):
     def __init__(self, args: ModelArgs):
@@ -142,73 +162,78 @@ class Attention(nn.Module):
         self.n_rep = self.n_local_heads // self.n_local_kv_heads
         self.head_dim = args.dim // args.n_heads
 
-        self.q_proj = ColumnParallelLinear(
-            args.dim, args.n_heads * self.head_dim, bias=False
-        )
-        self.k_proj = ColumnParallelLinear(
-            args.dim, self.n_kv_heads * self.head_dim, bias=False
-        )
-        self.v_proj = ColumnParallelLinear(
-            args.dim, self.n_kv_heads * self.head_dim, bias=False
-        )
-        self.o_proj = RowParallelLinear(
-            args.n_heads * self.head_dim,
-            args.dim,
-            bias=False,
-            input_is_parallel=True
-        )
+        # Column/Row‑parallel layers hold parameters; we may bypass their forward
+        self.q_proj = ColumnParallelLinear(args.dim, args.n_heads * self.head_dim, bias=False)
+        self.k_proj = ColumnParallelLinear(args.dim, self.n_kv_heads * self.head_dim, bias=False)
+        self.v_proj = ColumnParallelLinear(args.dim, self.n_kv_heads * self.head_dim, bias=False)
+        self.o_proj = RowParallelLinear(args.n_heads * self.head_dim, args.dim, bias=False, input_is_parallel=True)
 
+        # KV‑cache (local to this rank)
         shape = (args.max_batch_size, args.max_seq_len, self.n_local_kv_heads, self.head_dim)
         self.register_buffer("cache_k", torch.zeros(shape), persistent=False)
         self.register_buffer("cache_v", torch.zeros(shape), persistent=False)
 
+    # --------------------------------------------------------------------- #
+    def _proj(self, name: str, x: torch.Tensor, layer: ColumnParallelLinear):
+        """Chunked projection → cat → reshape."""
+        # We reuse layer.weight to keep parameter sharing; bias is None.
+        out = _chunked_linear(x, layer.weight, name_prefix=name)  # [B,T, out_dim]
+        hd = self.head_dim
+        n_heads = (out.shape[-1] // hd)
+        return out.view(x.size(0), x.size(1), n_heads, hd)
+
+    # --------------------------------------------------------------------- #
     def forward(self, x, start_pos, freqs_cis, mask):
         B, T, _ = x.shape
         hd = self.head_dim
 
-        with trace_op("Q_proj", op="Linear", inputs={"x": x}, output_shape=(B, T, self.n_local_heads, hd)):
-            q = self.q_proj(x).view(B, T, self.n_local_heads, hd)
-        with trace_op("K_proj", op="Linear", inputs={"x": x}, output_shape=(B, T, self.n_local_kv_heads, hd)):
-            k = self.k_proj(x).view(B, T, self.n_local_kv_heads, hd)
-        with trace_op("V_proj", op="Linear", inputs={"x": x}, output_shape=(B, T, self.n_local_kv_heads, hd)):
-            v = self.v_proj(x).view(B, T, self.n_local_kv_heads, hd)
+        q = self._proj("Q_proj", x, self.q_proj)
+        k = self._proj("K_proj", x, self.k_proj)
+        v = self._proj("V_proj", x, self.v_proj)
 
-        with trace_op("RoPE", op="RoPE", inputs={"q": q, "k": k}, output_shape=q.shape):
+        with _dispatch("RoPE", op="RoPE", q_shape=q.shape, k_shape=k.shape):
             q, k = apply_rotary_emb(q, k, freqs_cis)
 
-        with trace_op("KV_write", op="MemCopy", inputs={"K": k, "V": v}):
-            self.cache_k[:, start_pos:start_pos+T] = k
-            self.cache_v[:, start_pos:start_pos+T] = v
+        # ----------------------------------------------------------------- #
+        # KV cache write (memcpy slice)
+        with _dispatch("KV_write", op="MemCopy", T=T):
+            self.cache_k[:, start_pos:start_pos + T] = k
+            self.cache_v[:, start_pos:start_pos + T] = v
 
-        keys = repeat_kv(self.cache_k[:, :start_pos+T], self.n_rep)
-        values = repeat_kv(self.cache_v[:, :start_pos+T], self.n_rep)
+        keys   = repeat_kv(self.cache_k[:, :start_pos + T], self.n_rep)
+        values = repeat_kv(self.cache_v[:, :start_pos + T], self.n_rep)
 
-        attn_out = []
+        # ----------------------------------------------------------------- #
+        # Per‑head attention
+        inv_sqrt_d = 1.0 / math.sqrt(hd)
+        ctx_heads: List[torch.Tensor] = []
+
         for h in range(self.n_local_heads):
-            qh = q[:, :, h, :]
-            kh = keys[:, :, h, :]
-            vh = values[:, :, h, :]
+            qh, kh, vh = q[:, :, h, :], keys[:, :, h, :], values[:, :, h, :]
 
-            with trace_op(f"Dot_H{h}", op="MatMul", inputs={"q": qh, "k": kh}):
-                scores = torch.einsum("btd,bsd->bts", qh, kh) / math.sqrt(hd)
+            # ① Q·Kᵀ
+            with _dispatch(f"H{h}_QK", op="MatMul", q_shape=qh.shape, k_shape=kh.shape):
+                score_h = torch.einsum("btd,bsd->bts", qh, kh) * inv_sqrt_d
 
-            with trace_op(f"Softmax_MaxSub_H{h}", op="MaxSub", inputs={"scores": scores}):
-                scores = scores - scores.amax(-1, keepdim=True)
-            with trace_op(f"Softmax_Exp_H{h}", op="Exp", inputs={"scores": scores}):
-                scores = scores.exp()
-            with trace_op(f"Softmax_Norm_H{h}", op="Normalize", inputs={"scores": scores}):
-                scores = scores / scores.sum(-1, keepdim=True)
+            # ② 3‑pass soft‑max
+            with _dispatch(f"H{h}_SoftmaxP1", op="ReduceMax", in_shape=score_h.shape):
+                max_h = score_h.max(-1, keepdim=True)
+            with _dispatch(f"H{h}_SoftmaxP2", op="ElementwiseExp"):
+                score_h = (score_h - max_h).exp()
+            with _dispatch(f"H{h}_SoftmaxP3", op="Normalize"):
+                score_h = score_h / score_h.sum(-1, keepdim=True)
 
-            with trace_op(f"AttnV_H{h}", op="MatMul", inputs={"scores": scores, "v": vh}):
-                out_h = torch.einsum("bts,bsd->btd", scores, vh)
-            attn_out.append(out_h)
+            # ③ Attention · V
+            with _dispatch(f"H{h}_ValueMM", op="MatMul", score_shape=score_h.shape, v_shape=vh.shape):
+                ctx_h = torch.einsum("bts,bsd->btd", score_h, vh)
+            ctx_heads.append(ctx_h)
 
-        cat = torch.cat(attn_out, dim=-1)
-        with trace_op("O_proj", op="Linear", inputs={"cat": cat}, output_shape=cat.shape):
+        cat = torch.cat(ctx_heads, dim=-1)          # [B,T, n_local_heads*hd]
+        with _dispatch("O_proj", op="Linear", cat_shape=cat.shape):
             return self.o_proj(cat)
 
 # --------------------------------------------------------------------------- #
-# FEED FORWARD WITH METADATA TRACING                                          #
+# FEED‑FORWARD                                                                #
 # --------------------------------------------------------------------------- #
 class FeedForward(nn.Module):
     def __init__(self, dim, hidden_dim, multiple_of, ffn_dim_multiplier):
@@ -223,16 +248,16 @@ class FeedForward(nn.Module):
         self.w2 = RowParallelLinear(hidden_dim, dim, bias=False, input_is_parallel=True)
 
     def forward(self, x):
-        with trace_op("GateUp", op="Linear", inputs={"X": x}):
+        with _dispatch("GateUp", op="Linear", X_shape=x.shape):
             g = self.w1(x)
             u = self.w3(x)
-        with trace_op("SiLU", op="Activation", inputs={"G": g}):
-            act = torch.nn.functional.silu(g) * g
-        with trace_op("Down", op="Linear", inputs={"Act": act}):
+        with _dispatch("SiLU", op="Activation", G_shape=g.shape):
+            act = torch.nn.functional.silu(g) * u
+        with _dispatch("Down", op="Linear", Act_shape=act.shape):
             return self.w2(act)
 
 # --------------------------------------------------------------------------- #
-# TRANSFORMER BLOCK + MODEL                                                   #
+# TRANSFORMER BLOCK                                                           #
 # --------------------------------------------------------------------------- #
 class TransformerBlock(nn.Module):
     def __init__(self, idx: int, args: ModelArgs):
@@ -240,33 +265,30 @@ class TransformerBlock(nn.Module):
         self.idx = idx
         self.attn = Attention(args)
         self.attn_norm = RMSNorm(args.dim, eps=args.norm_eps)
-        self.ffn = FeedForward(
-            args.dim, 4 * args.dim, args.multiple_of, args.ffn_dim_multiplier
-        )
+        self.ffn = FeedForward(args.dim, 4 * args.dim, args.multiple_of, args.ffn_dim_multiplier)
         self.ffn_norm = RMSNorm(args.dim, eps=args.norm_eps)
 
     def forward(self, x, start_pos, freqs_cis, mask):
-        with trace_op(f"Block{self.idx}_Attn", op="ResidualAdd", inputs={"X": x}):
+        with _dispatch(f"Block{self.idx}_Residual1", op="ResidualAdd", X_shape=x.shape):
             h = x + self.attn(self.attn_norm(x), start_pos, freqs_cis, mask)
-        with trace_op(f"Block{self.idx}_MLP", op="ResidualAdd", inputs={"H": h}):
+        with _dispatch(f"Block{self.idx}_Residual2", op="ResidualAdd", H_shape=h.shape):
             return h + self.ffn(self.ffn_norm(h))
 
+# --------------------------------------------------------------------------- #
+# TOP‑LEVEL TRANSFORMER                                                       #
+# --------------------------------------------------------------------------- #
 class Transformer(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
         self.params = args
         self.tok_embeddings = VocabParallelEmbedding(args.vocab_size, args.dim)
-        self.layers = nn.ModuleList(
-            [TransformerBlock(i, args) for i in range(args.n_layers)]
-        )
+        self.layers = nn.ModuleList([TransformerBlock(i, args) for i in range(args.n_layers)])
         self.norm = RMSNorm(args.dim, eps=args.norm_eps)
         self.output = ColumnParallelLinear(args.dim, args.vocab_size, bias=False)
 
         self.register_buffer(
             "freqs_cis",
-            precompute_freqs_cis(
-                args.dim // args.n_heads, args.max_seq_len * 2, args.rope_theta
-            ),
+            precompute_freqs_cis(args.dim // args.n_heads, args.max_seq_len * 2, args.rope_theta),
             persistent=False,
         )
 
@@ -276,6 +298,7 @@ class Transformer(nn.Module):
         h = self.tok_embeddings(tokens)
         freqs_cis = self.freqs_cis[start_pos : start_pos + seqlen].to(h.device)
 
+        # Generate an autoregressive mask if we are decoding more than one token
         mask = None
         if seqlen > 1:
             mask = torch.full((seqlen, seqlen), float("-inf"), device=tokens.device)
@@ -286,4 +309,7 @@ class Transformer(nn.Module):
         for layer in self.layers:
             h = layer(h, start_pos, freqs_cis, mask)
 
-        return self.output(self.norm(h)).float()
+        with _dispatch("FinalNorm", op="RMSNorm", H_shape=h.shape):
+            h = self.norm(h)
+        with _dispatch("LMHead", op="Linear", H_shape=h.shape):
+            return self.output(h).float()
