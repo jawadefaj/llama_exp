@@ -32,14 +32,5 @@ bash setup.sh
 huggingface-cli download meta-llama/Llama-3.2-1B \
     --local-dir ./models/Llama-3.2-1B
 
-# 3 · Sanity-check – local .pth shards text-completion
-python example_text_completion.py
-
-# 4 · Generate Perfetto JSON trace on a HF checkpoint (layer 0)
-python load_model_and_simulate_perfetto.py
-# ↪ writes  llama_block_trace_<model>_<timestamp>.json
-# ↪ open https://trace.perfetto.dev and drop the file
-
-# 5 · (Optional) TensorBoard profile
-python pytorch_profiler.py
-tensorboard --logdir ./log/hf_llama_block_trace
+# 3 · Generate Perfetto JSON trace on a HF checkpoint (layer 0)
+torchrun   --nproc_per_node=2   --master_addr=127.0.0.1   --master_port=29500   load_model_from_weight_distributed.py
