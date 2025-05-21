@@ -46,3 +46,4 @@ trash-checkpoint.txt
 /models
 *.json
 /nautilus
+/model
