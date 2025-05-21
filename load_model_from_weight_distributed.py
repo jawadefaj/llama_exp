@@ -79,7 +79,7 @@ logger.debug(f"Max seq len:         {MAX_SEQ_LEN}")
 logger.debug(f"Max batch size:      {MAX_BATCH_SIZE}")
 
 # ───── 4. Late imports ─────
-from llama._model import ModelArgs, Transformer
+from llama.model import ModelArgs, Transformer
 from llama.tokenizer import Tokenizer
 logger.debug("Imported ModelArgs, Transformer, and Tokenizer classes")
 
