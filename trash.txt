@@ -93,3 +93,25 @@ LlamaConfig {
   "vocab_size": 128256
 }
 
+
+
+
+
+list of compute in the code 
+
+
+Attention.forward
+
+
+1. Attention.forward
+Step	What mathematically happens	Tracer slice (op=)
+1	Chunked linear projections to get queries Q, keys K, values V (matrix–vector GEMMs, four parallel streams)	Linear (one per chunk)
+2	Rotary positional encoding multiplies every 2-D sub-vector of Q/K by a complex sinusoid	RoPE
+3	Write into KV-cache – copy the fresh slice to the pre-allocated tensor that stores past tokens	MemCopy
+4	Dot-product attention (per head)	
+ 4 a	scaled dot product MatMul
+ 4 b	three-pass soft-max ① reduce-max, ② exponentiate, ③ normalise	ReduceMax, ElementwiseExp, Normalize
+ 4 c	attention-weighted value mix Softmax⋅V	MatMul
+5	Concatenate heads and apply the output projection h	Linear
+
+Compute types present: matmul, element-wise exp, vector reductions, memory copy, position-wise complex multiply, concatenation.
