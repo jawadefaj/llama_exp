@@ -35,6 +35,7 @@ def tensor_meta(name: str, x: torch.Tensor) -> dict:
 _CPU_TRACK = tg4perfetto.track("CPU")
 _GPU_TRACK = tg4perfetto.track("GPU")
 
+@contextlib.contextmanager
 def trace_op(name: str, **meta):
     # choose track by device type
     device = meta.get("device")
