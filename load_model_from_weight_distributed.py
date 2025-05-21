@@ -63,7 +63,7 @@ else:
 logger.debug(f"Process group initialized: rank {global_rank}/{world_size}, device={DEVICE}")
 
 # ───── 2. Model-parallel initialization ─────
-fs_init.initialize_model_parallel(world_size)
+fs_init.initialize_model_parallel(1)
 logger.debug(f"Model parallel initialized with world_size={world_size}")
 
 # ───── 3. Paths & hyperparameters ─────
