@@ -28,16 +28,17 @@ def tensor_meta(name: str, x: torch.Tensor) -> dict:
 
 # --- Perfetto tracing setup ---
 # single global trace to combine all events into one file
-_trace = tg4perfetto.Trace(session_name="llama_trace")
+_trace = tg4perfetto.trace(session_name="llama_trace")
 _CPU_TRACK = _trace.track("CPU")
 _GPU_TRACK = _trace.track("GPU")
+
+import atexit
 
 def _write_trace():
     # write combined trace at exit
     _trace.save("llama_perfetto_trace.json")
 
 # ensure we flush on program end
-import atexit
 atexit.register(_write_trace)
 
 def trace_op(name: str, **meta):
@@ -52,16 +53,6 @@ def trace_op(name: str, **meta):
         cm.__exit__(None, None, None)
 
 # context manager wrapper
-@contextlib.contextmanager
-def _dispatch(name: str, op: str, **meta):
-    meta = dict(meta)
-    if torch.cuda.is_available():
-        meta["device"] = f"cuda:{torch.cuda.current_device()}"
-    else:
-        meta["device"] = f"cpu:{dist.get_rank() if dist.is_initialized() else 0}"
-    meta["op"] = op
-    with trace_op(name, **meta):
-        yield
 @contextlib.contextmanager
 def _dispatch(name: str, op: str, **meta):
     meta = dict(meta)

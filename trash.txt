@@ -95,7 +95,7 @@ LlamaConfig {
 
 
 
-
+torchrun --nproc_per_node=2 --master_addr=127.0.0.1 --master_port=29500 load_model_from_weight_distributed.py
 
 list of compute in the code 
 
