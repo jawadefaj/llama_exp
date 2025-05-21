@@ -79,10 +79,9 @@ def _chunked_linear(x, weight, name_prefix, n_chunks=N_ENGINES):
     torch.cuda.synchronize()
     return torch.cat(outs, dim=-1)
 
-def proj_with_chunking(name: str, x: torch.Tensor, layer: ColumnParallelLinear) -> torch.Tensor:
+def proj_with_chunking(name: str, x: torch.Tensor, layer: ColumnParallelLinear, head_dim: int) -> torch.Tensor:
     out = _chunked_linear(x, layer.weight, name_prefix=name)
-    hd = out.shape[-1] // (x.shape[-1] // layer.input_size_per_partition)
-    return out.view(x.size(0), x.size(1), -1, hd)
+    return out.view(x.size(0), x.size(1), -1, head_dim)
 
 # --- Model Args ---
 @dataclass
@@ -149,9 +148,9 @@ class Attention(nn.Module):
     def forward(self, x, start_pos, freqs_cis, mask):
         B, T, _ = x.shape
         hd = self.head_dim
-        q = proj_with_chunking("Q_proj", x, self.q_proj)
-        k = proj_with_chunking("K_proj", x, self.k_proj)
-        v = proj_with_chunking("V_proj", x, self.v_proj)
+        q = proj_with_chunking("Q_proj", x, self.q_proj, self.head_dim)
+        k = proj_with_chunking("K_proj", x, self.k_proj, self.head_dim)
+        v = proj_with_chunking("V_proj", x, self.v_proj, self.head_dim)
 
         with _dispatch("RoPE", op="RoPE", **tensor_meta("q", q)):
             q, k = apply_rotary_emb(q, k, freqs_cis)
