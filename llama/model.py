@@ -140,13 +140,40 @@ def repeat_kv(x: torch.Tensor, n_rep: int):
 # INTERNAL helper – chunked linear (no bias) with dispatch per chunk          #
 # --------------------------------------------------------------------------- #
 
-def _chunked_linear(x: torch.Tensor, weight: torch.Tensor, name_prefix: str, n_chunks: int = N_ENGINES):
-    """Split *weight* rows into n_chunks and run F.linear for each, traced."""
+# --------------------------------------------------------------------------- #
+# INTERNAL helper – chunked linear with true overlap via CUDA streams         #
+# --------------------------------------------------------------------------- #
+def _chunked_linear(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    name_prefix: str,
+    n_chunks: int = N_ENGINES,
+):
+    """
+    Split `weight` rows into `n_chunks` and launch each F.linear on its own
+    CUDA stream so the kernels overlap.  Falls back to serial execution on CPU.
+    """
+    if not torch.cuda.is_available():
+        # ---- CPU or --cuda off → just run the old serial helper ------------
+        outs = []
+        for idx, w in enumerate(torch.chunk(weight, n_chunks, dim=0)):
+            with _dispatch(f"{name_prefix}#{idx}", op="Linear", w_shape=w.shape):
+                outs.append(F.linear(x, w))
+        return torch.cat(outs, dim=-1)
+
+    # ---- GPU path: real overlap via independent streams --------------------
     w_splits = torch.chunk(weight, n_chunks, dim=0)
-    outs = []
-    for idx, w in enumerate(w_splits):
-        with _dispatch(f"{name_prefix}#{idx}", op="Linear", w_shape=w.shape, x_shape=x.shape):
-            outs.append(F.linear(x, w))
+    streams  = [torch.cuda.Stream(device=x.device) for _ in w_splits]
+    outs     = [None] * len(w_splits)
+
+    for idx, (w, st) in enumerate(zip(w_splits, streams)):
+        with _dispatch(f"{name_prefix}#{idx}", op="Linear", w_shape=w.shape):
+            # launch kernel on its private stream
+            with torch.cuda.stream(st):
+                outs[idx] = F.linear(x, w)
+
+    # ensure all streams have finished before we concatenate
+    torch.cuda.synchronize()
     return torch.cat(outs, dim=-1)
 
 # --------------------------------------------------------------------------- #
