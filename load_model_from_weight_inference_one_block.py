@@ -45,6 +45,10 @@ if gpu_count:
         p = torch.cuda.get_device_properties(i)
         logger.debug(f"  GPU {i}: {p.name}, {p.total_memory/1_073_741_824:.1f} GB")
 
+# ────────── Explicitly set number of threads PyTorch uses ─────────────── #
+torch.set_num_threads(cpu_count)
+logger.debug(f"Set PyTorch CPU thread count explicitly: {cpu_count} threads")
+
 # ─────────────────── 1. Distributed init  ──────────────────────────────── #
 backend = "nccl" if torch.cuda.is_available() else "gloo"
 if os.environ.get("USE_LIBUV", "0") == "0":
@@ -52,7 +56,7 @@ if os.environ.get("USE_LIBUV", "0") == "0":
         backend=backend,
         init_method="tcp://127.0.0.1:29500",
         rank=int(os.environ.get("RANK", "0")),
-        world_size=int(os.environ.get("WORLD_SIZE", "1")),
+        world_size=int(os.environ.get("WORLD_SIZE", gpu_count)),
     )
 else:
     dist.init_process_group(backend=backend, init_method="env://")

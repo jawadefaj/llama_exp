@@ -8,18 +8,6 @@ Visualise **one transformer block** of any LLaMA-3.2 checkpoint with **Perfetto*
 
 ---
 
-## ✅ Current Progress
-
-| # | Requirement | Status |
-|---|-------------|:------:|
-| **1** | Load model from Hugging Face **safetensors** and local **`.pth`** shards | **✔** |
-| **2** | Auto-generate **Perfetto trace** for one block | **✔** |
-| **3** | Trace **adapts to any model size / dims** | **✔** |
-| **4** | Annotate each span with **op-type + I/O tensor metadata** | **▲** |
-
-Legend — **✔ done**, **▲ partial**, **✗ todo**
-
----
 
 ## 🔧 Quick Start
 
@@ -32,14 +20,8 @@ bash setup.sh
 huggingface-cli download meta-llama/Llama-3.2-1B \
     --local-dir ./models/Llama-3.2-1B
 
-# 3 · Sanity-check – local .pth shards text-completion
-python example_text_completion.py
-
-# 4 · Generate Perfetto JSON trace on a HF checkpoint (layer 0)
-python load_model_and_simulate_perfetto.py
-# ↪ writes  llama_block_trace_<model>_<timestamp>.json
+# 3 · Generate Perfetto JSON trace on a HF checkpoint (layer 0)
+torchrun   --nproc_per_node=2   --master_addr=127.0.0.1   --master_port=29500 load_model_from_weight_distributed.py
+# ↪ writes  .json file in log folder
 # ↪ open https://trace.perfetto.dev and drop the file
 
-# 5 · (Optional) TensorBoard profile
-python pytorch_profiler.py
-tensorboard --logdir ./log/hf_llama_block_trace
