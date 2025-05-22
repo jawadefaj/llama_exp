@@ -9,6 +9,13 @@ Visualise **one transformer block** of any LLaMA-3.2 checkpoint with **Perfetto*
 
 ---
 
+## 📸 Example Visualization
+
+![Perfetto Trace of One Transformer Block](images/perfetto_one_block.jpg)
+
+
+---
+
 ## 🔧 Quick Start
 
 ```bash
