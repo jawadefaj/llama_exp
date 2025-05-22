@@ -115,3 +115,10 @@ Step	What mathematically happens	Tracer slice (op=)
 5	Concatenate heads and apply the output projection h	Linear
 
 Compute types present: matmul, element-wise exp, vector reductions, memory copy, position-wise complex multiply, concatenation.
+
+
+
+
+
+For realistic timing I need to bench mark the operations 
+
