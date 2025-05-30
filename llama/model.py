@@ -1,7 +1,6 @@
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# This software may be used and distributed in accordance with the terms of the Llama 3 Community License Agreement.
-# llama/model_cpu_timed.py  •  CPU-only fine-grained Perfetto tracing with real timings
-
+# -----------------------------------------------------------------------------
+# model.py (in llama/model.py)
+# -----------------------------------------------------------------------------
 import math
 from dataclasses import dataclass
 from typing import Optional
@@ -40,15 +39,18 @@ class RMSNorm(nn.Module):
     def forward(self, x):
         return (x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)).type_as(x) * self.weight
 
+
 def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0):
     freqs = 1.0 / (theta ** (torch.arange(0, dim, 2).float() / dim))
     t = torch.arange(end, dtype=torch.float32, device=freqs.device)
     return torch.polar(torch.ones((end, dim//2), device=freqs.device), torch.outer(t, freqs))
 
+
 def reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor):
     ndim = x.ndim
     shape = [d if i in (1, ndim - 1) else 1 for i, d in enumerate(x.shape)]
     return freqs_cis.view(*shape)
+
 
 def apply_rotary_emb(xq: torch.Tensor, xk: torch.Tensor, freqs_cis: torch.Tensor):
     meta = {**perfetto_tracer.tensor_meta("xq_in", xq), **perfetto_tracer.tensor_meta("xk_in", xk)}
@@ -59,6 +61,7 @@ def apply_rotary_emb(xq: torch.Tensor, xk: torch.Tensor, freqs_cis: torch.Tensor
         xq_out = torch.view_as_real(xq_c * freqs_b).flatten(3).type_as(xq)
         xk_out = torch.view_as_real(xk_c * freqs_b).flatten(3).type_as(xk)
     return xq_out, xk_out
+
 
 def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
     if n_rep == 1:
@@ -90,11 +93,11 @@ class Attention(nn.Module):
     def forward(self, x, start_pos, freqs_cis, mask):
         bsz, seqlen, _ = x.shape
 
-        with perfetto_tracer.dispatch("Q_proj", "Linear", **perfetto_tracer.tensor_meta("x", x)):
+        with perfetto_tracer.dispatch("Q_proj", "MatMul", **perfetto_tracer.tensor_meta("x", x)):
             xq = self.wq(x)
-        with perfetto_tracer.dispatch("K_proj", "Linear", **perfetto_tracer.tensor_meta("x", x)):
+        with perfetto_tracer.dispatch("K_proj", "MatMul", **perfetto_tracer.tensor_meta("x", x)):
             xk = self.wk(x)
-        with perfetto_tracer.dispatch("V_proj", "Linear", **perfetto_tracer.tensor_meta("x", x)):
+        with perfetto_tracer.dispatch("V_proj", "MatMul", **perfetto_tracer.tensor_meta("x", x)):
             xv = self.wv(x)
 
         xq = xq.view(bsz, seqlen, self.n_local_heads,    self.head_dim)
@@ -130,8 +133,9 @@ class Attention(nn.Module):
         with perfetto_tracer.dispatch("ConcatHeads", "Reshape", **perfetto_tracer.tensor_meta("ctx", context)):
             out = context.transpose(1,2).contiguous().view(bsz, seqlen, -1)
 
-        with perfetto_tracer.dispatch("O_proj", "Linear", **perfetto_tracer.tensor_meta("out", out)):
+        with perfetto_tracer.dispatch("O_proj", "MatMul", **perfetto_tracer.tensor_meta("out", out)):
             return self.wo(out)
+
 
 class FeedForward(nn.Module):
     def __init__(self, dim: int, hidden_dim: int, multiple_of: int, ffn_dim_multiplier: Optional[float]):

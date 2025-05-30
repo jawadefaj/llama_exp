@@ -1,7 +1,5 @@
+# load_model.py
 #!/usr/bin/env python3
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# Used and distributed under the terms of the Llama 3 Community License Agreement.
-
 import os
 import logging
 from pathlib import Path
@@ -51,9 +49,9 @@ dist.init_process_group(
     rank=int(os.environ.get("RANK", "0")),
     world_size=int(os.environ.get("WORLD_SIZE", gpu_count if gpu_count else 1)),
 )
-local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+local_rank  = int(os.environ.get("LOCAL_RANK", "0"))
 global_rank = dist.get_rank()
-world_size = dist.get_world_size()
+world_size  = dist.get_world_size()
 
 if torch.cuda.is_available():
     torch.cuda.set_device(local_rank)
@@ -68,11 +66,11 @@ fs_init.initialize_model_parallel(1)
 logger.debug("Model-parallel world initialized (tensor-parallel=1)")
 
 # ───────────── Paths & runtime hyper-params ───────────────────────
-SCRIPT_ROOT = Path(__file__).resolve().parent
-CKPT_DIR = SCRIPT_ROOT / "model" / "Llama-3.2-1B"
+SCRIPT_ROOT    = Path(__file__).resolve().parent
+CKPT_DIR       = SCRIPT_ROOT / "model" / "Llama-3.2-1B"
 TOKENIZER_PATH = CKPT_DIR / "tokenizer.model"
-MAX_SEQ_LEN = 128
-MAX_BATCH = 1
+MAX_SEQ_LEN    = 128
+MAX_BATCH      = 1
 
 logger.debug(f"Checkpoint dir: {CKPT_DIR}")
 logger.debug(f"Tokenizer path: {TOKENIZER_PATH}")
@@ -92,11 +90,7 @@ logger.debug(f"Selected ckpt (rank={global_rank}): {ckpt_file.name}")
 raw_sd = torch.load(ckpt_file, map_location=DEVICE)
 logger.debug(f"Raw state-dict loaded with {len(raw_sd)} keys (sample {list(raw_sd)[:5]})")
 
-# print([k for k in raw_sd.keys() if 'norm' in k])
-
-
-
-# No key remapping for original_model compatibility!
+# Remap keys for model
 state_dict = {}
 for k, v in raw_sd.items():
     nk = (
@@ -107,11 +101,10 @@ for k, v in raw_sd.items():
     )
     state_dict[nk] = v
 
-
 # ───────────── Build model & load weights ─────────────────────────
 with open(CKPT_DIR / "params.json") as f:
     params = json.load(f)
-params.pop("use_scaled_rope", None)  # older checkpoints may include this flag
+params.pop("use_scaled_rope", None)
 
 model_args = ModelArgs(max_seq_len=MAX_SEQ_LEN, max_batch_size=MAX_BATCH, **params)
 logger.debug(f"ModelArgs: {model_args}")
@@ -124,9 +117,6 @@ model = Transformer(model_args).to(DEVICE)
 param_total = sum(p.numel() for p in model.parameters())
 logger.debug(f"Model instantiated ({param_total:,} parameters)")
 
-# print([k for k in model.state_dict().keys() if 'norm' in k])
-
-
 logger.debug("Loading checkpoint weights …")
 missing, unexpected = model.load_state_dict(state_dict, strict=False)
 logger.debug(f"Loaded weights: missing={len(missing)}, unexpected={len(unexpected)}")
@@ -137,9 +127,8 @@ if missing or unexpected:
 # ───────────── Helper: forward a SINGLE block ────────────────────
 @torch.inference_mode()
 def run_one_block(model: Transformer, tokens: torch.Tensor, *, start_pos: int = 0, block_idx: int = 0):
-    """Replicates embedding + mask logic, then forwards exactly one TransformerBlock."""
     B, T = tokens.shape
-    h = model.tok_embeddings(tokens)                     # (B, T, d)
+    h     = model.tok_embeddings(tokens)
     freqs = model.freqs_cis[start_pos:start_pos+T].to(h.device)
 
     mask = None
@@ -147,7 +136,7 @@ def run_one_block(model: Transformer, tokens: torch.Tensor, *, start_pos: int = 
         causal = torch.full((T, T), float("-inf"), device=tokens.device)
         causal = torch.triu(causal, diagonal=1)
         prefix = torch.zeros((T, start_pos), device=tokens.device)
-        mask = torch.hstack([prefix, causal]).type_as(h)
+        mask   = torch.hstack([prefix, causal]).type_as(h)
 
     block = model.layers[block_idx]
     return block(h, start_pos, freqs, mask)
@@ -158,9 +147,8 @@ trace_path = TRACE_DIR / f"block{BLOCK_INDEX}_trace_rank{global_rank}_{int(time.
 logger.debug(f"Tracing ONE block → {trace_path}")
 
 with tg4perfetto.open(trace_path):
-    with torch.inference_mode():
-        prompt = torch.tensor([[tokenizer.bos_id]], device=DEVICE)
-        _ = run_one_block(model, prompt, start_pos=0, block_idx=BLOCK_INDEX)
+    prompt = torch.tensor([[tokenizer.bos_id]], device=DEVICE)
+    _ = run_one_block(model, prompt, start_pos=0, block_idx=BLOCK_INDEX)
 
 logger.debug("Perfetto trace finished ✅")
 print("Trace written to:", trace_path)
